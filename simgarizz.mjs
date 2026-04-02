@@ -37,6 +37,34 @@ function ask(rl, question) {
     return new Promise(resolve => rl.question(question, answer => resolve(answer.trim())));
 }
 
+// ===== CHECK FOR DUB =====
+async function checkForDub(page) {
+    try {
+        const found = await page.evaluate(() => {
+            const btn = document.querySelector(
+                "#servers-content > div.ps_-block.ps_-block-sub.servers-dub > div.ps__-list > div:nth-child(1) > a"
+            );
+            return !!btn;
+        });
+        return found;
+    } catch {
+        return false;
+    }
+}
+
+// ===== CLICK DUB SERVER =====
+async function clickDubServer(page) {
+    const clicked = await page.evaluate(() => {
+        const btn = document.querySelector(
+            "#servers-content > div.ps_-block.ps_-block-sub.servers-dub > div.ps__-list > div:nth-child(1) > a"
+        );
+        if (!btn) return false;
+        btn.click();
+        return true;
+    });
+    return clicked;
+}
+
 // ===== INTERACTIVE SETUP =====
 async function promptConfig() {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -52,7 +80,6 @@ async function promptConfig() {
         if (!firstEpisodeUrl.startsWith("http")) console.log("⚠ Please enter a valid URL starting with http");
     }
 
-    // Extract base URL from the episode URL
     const parsedUrl = new URL(firstEpisodeUrl);
     const baseUrl = `${parsedUrl.protocol}//${parsedUrl.hostname}`;
 
@@ -69,34 +96,40 @@ async function promptConfig() {
         const lastInput = await ask(rl, `\n🔢 Download up to which episode NUMBER? (e.g. 23): `);
         if (lastInput && !isNaN(parseInt(lastInput))) {
             lastEpisode = parseInt(lastInput);
-            if (lastEpisode < startEpisode) {
-                console.log(`⚠ Must be >= ${startEpisode}`);
-            }
+            if (lastEpisode < startEpisode) console.log(`⚠ Must be >= ${startEpisode}`);
         }
     }
 
     // Get optional custom download folder
     const folderInput = await ask(rl, `\n📁 Download folder (press Enter for default: ${downloadDir}):\n> `);
     if (folderInput) {
-        if (ensureWritableDir(folderInput)) {
-            downloadDir = folderInput;
-        } else {
-            console.log(`⚠ Cannot use that folder, sticking with: ${downloadDir}`);
-        }
+        if (ensureWritableDir(folderInput)) downloadDir = folderInput;
+        else console.log(`⚠ Cannot use that folder, sticking with: ${downloadDir}`);
     }
 
     rl.close();
 
-    console.log("\n┌─────────────────────────────────────┐");
-    console.log(`│ First episode : ${firstEpisodeUrl.slice(0, 35)}...`);
-    console.log(`│ Episodes      : ${startEpisode} → ${lastEpisode}`);
-    console.log(`│ Save to       : ${downloadDir.slice(0, 35)}`);
-    console.log("└─────────────────────────────────────┘\n");
-
     return { firstEpisodeUrl, baseUrl, startEpisode, lastEpisode };
 }
 
-// ===== PUPPETEER SETUP =====
+// ===== ASK DUB/SUB AFTER BROWSER HAS CHECKED THE PAGE =====
+async function promptDubChoice(hasDub) {
+    if (!hasDub) {
+        console.log("ℹ No DUB available — downloading SUB");
+        return false;
+    }
+
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    console.log("\n✅ DUB version is available!");
+    const answer = await ask(rl, "🎙 Download SUB or DUB? (sub/dub): ");
+    rl.close();
+
+    const preferDub = answer.toLowerCase().startsWith("d");
+    console.log(preferDub ? "🎙 DUB selected\n" : "📝 SUB selected\n");
+    return preferDub;
+}
+
+// ===== PUPPETEER =====
 let browser;
 puppeteer.use(stealthPlugin());
 puppeteer.use(adblockerPlugin());
@@ -208,9 +241,7 @@ function startProxyServer(segmentMap, fetchHeaders) {
         const server = createServer(async (req, res) => {
             const key = req.url.slice(1).split("?")[0];
             const realUrl = segmentMap.get(key);
-            if (!realUrl) {
-                res.writeHead(404); res.end("Not found"); return;
-            }
+            if (!realUrl) { res.writeHead(404); res.end("Not found"); return; }
             try {
                 const { body } = await fetchUrl(realUrl, fetchHeaders);
                 res.writeHead(200, { "Content-Type": "video/mp2t", "Content-Length": body.length });
@@ -321,23 +352,42 @@ async function downloadEpisode(page, episodeName, masterUrl) {
                 reject(new Error(`FFmpeg failed with code ${code} for ${episodeName}`));
             }
         });
-        proc.on("error", err => { server.close(); try { fs.unlinkSync(playlistPath); } catch {} reject(err); });
+        proc.on("error", err => {
+            server.close();
+            try { fs.unlinkSync(playlistPath); } catch {}
+            reject(err);
+        });
     });
 }
 
 // ===== PROCESS EPISODE PAGE =====
-async function processEpisode(page, episodeUrl, episodeNumber, attempt = 1) {
+async function processEpisode(page, episodeUrl, episodeNumber, preferDub, attempt = 1) {
     console.log(`\n🌐 Episode ${episodeNumber} (attempt ${attempt}): ${episodeUrl}`);
     try {
         await page.goto(episodeUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
         await page.waitForSelector("#servers-content", { timeout: 15000 });
         await new Promise(r => setTimeout(r, 2000));
 
+        // Start listening for stream BEFORE clicking anything
         const streamPromise = waitForStream(page);
-        await page.evaluate(() => {
-            const btn = document.querySelector("#servers-content a");
-            if (btn) btn.click();
-        });
+
+        if (preferDub) {
+            console.log("🎙 Clicking DUB server...");
+            const clicked = await clickDubServer(page);
+            if (!clicked) {
+                console.warn("⚠ DUB server button not found, falling back to SUB");
+                await page.evaluate(() => {
+                    const btn = document.querySelector("#servers-content a");
+                    if (btn) btn.click();
+                });
+            }
+        } else {
+            await page.evaluate(() => {
+                const btn = document.querySelector("#servers-content a");
+                if (btn) btn.click();
+            });
+        }
+
         await new Promise(r => setTimeout(r, 2000));
         const streamUrl = await streamPromise;
         console.log("🎥 Stream found");
@@ -351,12 +401,14 @@ async function processEpisode(page, episodeUrl, episodeNumber, attempt = 1) {
             }
         } catch {}
 
+        episodeName = `${episodeName} [${preferDub ? "DUB" : "SUB"}]`;
         await downloadEpisode(page, episodeName, streamUrl);
+
     } catch (err) {
         if (attempt < MAX_RETRIES) {
             console.warn(`⚠ Failed: ${err.message}. Retrying in 5s...`);
             await new Promise(r => setTimeout(r, 5000));
-            return processEpisode(page, episodeUrl, episodeNumber, attempt + 1);
+            return processEpisode(page, episodeUrl, episodeNumber, preferDub, attempt + 1);
         }
         throw err;
     }
@@ -376,14 +428,10 @@ async function getNextEpisodeUrl(page, currentEpisode, baseUrl) {
 
 // ===== MAIN =====
 async function main() {
-    // Interactive config first, before launching browser
+    // ── Step 1: All terminal prompts FIRST, browser stays closed ──
     const { firstEpisodeUrl, baseUrl, startEpisode, lastEpisode } = await promptConfig();
 
-    console.log("📁 Download folder:", downloadDir);
-    console.log("🚀 Starting downloader...\n");
-    const startTime = Date.now();
-    const failed = [];
-
+    // ── Step 2: NOW open browser ──
     browser = await puppeteer.launch({
         headless: false,
         args: ["--no-sandbox", "--disable-setuid-sandbox"]
@@ -392,8 +440,30 @@ async function main() {
     const page = await browser.newPage();
     await blockResources(page);
 
+    // Warm up
     await page.goto("https://www.bing.com");
     await new Promise(r => setTimeout(r, 3000));
+
+    // ── Step 3: Navigate to first episode, check for dub ──
+    console.log("\n🔍 Checking for DUB availability...");
+    await page.goto(firstEpisodeUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await page.waitForSelector("#servers-content", { timeout: 15000 });
+    await new Promise(r => setTimeout(r, 2000));
+
+    const hasDub = await checkForDub(page);
+
+    // ── Step 4: Ask sub/dub in terminal ──
+    const preferDub = await promptDubChoice(hasDub);
+
+    console.log("┌─────────────────────────────────────────────────┐");
+    console.log(`│ Episodes  : ${startEpisode} → ${lastEpisode}`);
+    console.log(`│ Audio     : ${preferDub ? "DUB 🎙" : "SUB 📝"}`);
+    console.log(`│ Save to   : ${downloadDir.slice(0, 45)}`);
+    console.log("└─────────────────────────────────────────────────┘\n");
+
+    console.log("🚀 Starting downloader...\n");
+    const startTime = Date.now();
+    const failed = [];
 
     let currentUrl = firstEpisodeUrl;
     let episode = startEpisode;
@@ -401,7 +471,7 @@ async function main() {
     try {
         while (episode <= lastEpisode) {
             try {
-                await processEpisode(page, currentUrl, episode);
+                await processEpisode(page, currentUrl, episode, preferDub);
             } catch (err) {
                 console.error(`\n❌ Episode ${episode} permanently failed: ${err.message}`);
                 failed.push(episode);
